@@ -30,8 +30,9 @@ class Tokenizer:
     
     def __init__(self):
         self.merged={}
+        self.vocab=[]
         
-    def train(self,text,vocab_size):
+    def train(self,text:str,vocab_size:int):
         if vocab_size<256:
             raise ValueError("vocab size must be bigger than 256")
         
@@ -40,44 +41,102 @@ class Tokenizer:
         bytes_data=text.encode("utf-8")
         lists=list(bytes_data)
         merges={}
+        vocab={idx:bytes([idx]) for idx in range(256)}
         for i in range(num_it):
-            #get the dictionary 
+            #get the dictionary with the frequency 
             counts=get_pairs(lists)
             if not counts:
                 break
             #pair with most repetition 
             best_pair = max(counts, key=counts.get)
             #merge the most occurring pairs
-            lists=merge(lists,best_pair,256+i)
+            new_id=256+i
+            lists=merge(lists,best_pair,new_id)
             #this is needed for encoding 
             merges[best_pair]=256+i
+            vocab[new_id]=vocab[best_pair[0]]+vocab[best_pair[1]]
         
         self.merged=merges
+        self.vocab=vocab
+        
+        
+    def encode(self,text:str):
+        text_bytes=text.encode("utf-8")
+        lists=list(text_bytes)
+        while len(lists)>=2:
+            counts=get_pairs(lists)
+            
+            if not counts:
+                break
+            mini=float("inf")
+            lowest_pair=[]
+            for pair in counts:
+                curr_idx=self.merged.get(pair,float("inf"))
+                if curr_idx<mini:
+                    mini=curr_idx
+                    lowest_pair=pair
+            if len(lowest_pair)<2:
+                break
+            merge_idx=self.merged[lowest_pair]
+            lists=merge(lists,lowest_pair,merge_idx)
+            
+        return lists
+    
+    
+    def decode(self,lists:list)->str:
+        text_bytes=b""
+        for idx in lists:
+            text_bytes+=self.vocab[idx]
+        text=text_bytes.decode("utf-8")
+        return text
+        
         
     def save_to_disk(self, filename):
         with open(filename, "w") as f:
+            for word in self.vocab.items():
+                f.write(f"{word}\n")
+            word="\n"*10
+            f.write(word)
             for pair, token_id in self.merged.items():
                 f.write(f"{pair} {token_id}\n")
         
             
             
 def main():
-    text = """
-    low lower lowest
-    low lower lowest
+    # Training corpus
+    train_text = """
+    low lowber lowest
+    low locer lowest
     low lower
     """
 
     tokenizer = Tokenizer()
 
-    # Learn 20 new tokens (256 -> 276)
-    tokenizer.train(text, vocab_size=276)
-
-    tokenizer.save_to_disk("merges.txt")
+    # Train the tokenizer
+    tokenizer.train(train_text, vocab_size=260)
 
     print("Training completed!")
     print(f"Learned {len(tokenizer.merged)} merges.")
-    print("Saved merges to merges.txt")
+
+    # Save the learned vocabulary
+    tokenizer.save_to_disk("vocab.txt")
+    print("Vocabulary saved to vocab.txt")
+
+    # Encode some text
+    test_text = train_text
+
+    encoded = tokenizer.encode(test_text)
+
+    print("\nOriginal text:")
+    print(test_text)
+
+    print("\nEncoded token IDs:")
+    print(encoded)
+    
+    print("\nEncoded texts:")
+    for idx in encoded:
+        print(tokenizer.vocab[idx].decode("utf-8"))
+
 
 
 if __name__ == "__main__":
