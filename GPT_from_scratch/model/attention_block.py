@@ -1,22 +1,23 @@
 import torch 
 import torch.nn as nn
-import Attention from attention
-import LayerNorm from layer_norm
-import MLP from mlp
+from .attention import Attention 
+from .layer_norm import LayerNorm 
+from .mlp import MLP 
 
 
 class Attention_Block(nn.Module):
     def __init__(self,config):
+        super().__init__()
         self.lm1=LayerNorm(config.n_embd,bias=config.bias)
         self.attn=Attention(config)
         self.lm2=LayerNorm(config.n_embd,bias=config.bias)
         self.mlp=MLP(config)
         
     def forward(self,x):
-        x =lm1(x)
-        x=attn(x)
-        x=lm2(x)
-        x=mlp(x)
+        x =self.lm1(x)
+        x=self.attn(x)
+        x=self.lm2(x)
+        x=self.mlp(x)
         
         return x
         

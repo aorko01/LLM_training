@@ -1,2 +1,5 @@
 torch 
 pytest
+tiktoken
+requests
+numpy

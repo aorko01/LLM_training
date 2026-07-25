@@ -1,9 +1,12 @@
 import torch
 import torch.nn as nn
+from .attention_block import Attention_Block
+from .layer_norm import LayerNorm
+
 
 class GPT(nn.Module):
     def __init__(self,config):
-        super.__init__()
+        super().__init__()
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.config=config
@@ -12,7 +15,7 @@ class GPT(nn.Module):
             wte=nn.Embedding(config.vocab_size,config.n_embd),
             wpe=nn.Embedding(config.vocab_size,config.n_embd),
             drop=nn.Dropout(config.dropout),
-            attn_blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            attn_blocks = nn.ModuleList([Attention_Block(config) for _ in range(config.n_layer)]),
             ln_=LayerNorm(config.n_embd,bias=config.bias)
         ))
         #embedding->vocab
@@ -37,7 +40,7 @@ class GPT(nn.Module):
             if pn.endswith('c_proj.weight'):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
         
-    def _init_weights(self, module):
+    def __init__weights(self, module):
             if isinstance(module, nn.Linear):
                 torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
                 if module.bias is not None:
@@ -55,9 +58,9 @@ class GPT(nn.Module):
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
-        for block in self.transformer.h:
-            x = block(x)
-        x = self.transformer.ln_f(x)
+        for block in self.transformer.attn_blocks:
+            x=block(x)
+        x = self.transformer.ln_(x)
         
         logits=self.lm_head(x)
         

@@ -13,9 +13,9 @@ class Attention(nn.Module):
         self.Wv=nn.Linear(config.n_embd,config.n_embd)
         
         self.output=nn.Linear(config.n_embd,config.n_embd)
-        self.attn_dropout=nn.Dropout(config.drop_prob)
-        self.output_dropout=nn.Dropout(config.drop_prob)
-        self.dropout=config.drop_prob
+        self.attn_dropout=nn.Dropout(config.dropout)
+        self.output_dropout=nn.Dropout(config.dropout)
+        self.dropout=config.dropout
         
         self.n_head=config.n_head
         
@@ -42,10 +42,10 @@ class Attention(nn.Module):
         y=y.view(Batch,Token,Embedding)
         # or we can directly do reshpae that is essentially perform similar in this case but contiguous-> view still better 
         # y=output.reshpae(Batch,Token,Embedding)
-        y=output(y)
-        y=output_dropout(output)
+        y=self.output(y)
+        y=self.output_dropout(y)
                
-        return output
+        return y
         
         
         
