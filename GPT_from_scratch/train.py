@@ -25,14 +25,22 @@ enc=tiktoken.get_encoding('gpt2')
 tokens=enc.encode(text)
 B,T=4,32
 buf = torch.tensor(tokens[:B*T+1])
+buf=buf.to(device)
 x=buf[:-1].view(B,T)
 y=buf[1:].view(B,T)
-x = x.to(device)
-y = y.to(device)
-
 model = GPT(GPTConfig())
 model.to(device)
-logits=model(x)
-loss=claculate_loss(logits,y)
-print(loss)
+
+optimizer =torch.optim.AdamW(model.parameters(),lr=3e-4)
+for i in range(500):
+    optimizer.zero_grad()
+    logits=model(x)
+    loss=claculate_loss(logits,y)
+    loss.backward()
+    optimizer.step()
+    print((f"step{i}:loss:{loss.item()}"))
+    
+
+
+# print(loss)
 

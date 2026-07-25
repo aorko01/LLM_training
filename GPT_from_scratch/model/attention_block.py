@@ -14,10 +14,12 @@ class Attention_Block(nn.Module):
         self.mlp=MLP(config)
         
     def forward(self,x):
-        x =self.lm1(x)
-        x=self.attn(x)
-        x=self.lm2(x)
-        x=self.mlp(x)
-        
+        # x =self.lm1(x)
+        # x=self.attn(x)
+        # x=self.lm2(x)
+        # x=self.mlp(x)
+        #missed the residual stream and the loss was dramartically higher. can uncomment to check how the loss gets saturated 
+        x = x + self.attn(self.lm1(x))
+        x = x + self.mlp(self.lm2(x))
         return x
         
