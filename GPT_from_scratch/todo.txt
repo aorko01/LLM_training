@@ -1,0 +1,2 @@
+1.while scaling need to consider the max learning rate 
+2.skipped the varibale batch sizes

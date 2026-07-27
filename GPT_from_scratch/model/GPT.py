@@ -36,10 +36,13 @@ class GPT(nn.Module):
         #         for child in self.children():
         #             child.apply(fn)
 
+        # In the resisudal connection if we keep adding numbers from normal distribution the variance will keep increasing and the output will blow up. So, we scale down the weights of the residual projections by 1/sqrt(2*L) where L is the number of layers. This is done to keep the variance of the output of the residual connection same as that of the input. This is done in GPT-2 paper.
         # apply special scaled init to the residual projections, per GPT-2 paper
         for pn, p in self.named_parameters():
             if pn.endswith("c_proj.weight"):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
+                
+                
     def __init__weights(self, module):
         if isinstance(module, nn.Linear):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
@@ -47,6 +50,8 @@ class GPT(nn.Module):
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            
+            
     def forward(self, idx, targets=None):
         device = idx.device
         b, t = idx.size()
