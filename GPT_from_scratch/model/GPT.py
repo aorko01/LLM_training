@@ -1,5 +1,9 @@
+import math
+
 import torch
 import torch.nn as nn
+from torch.nn import functional as F
+
 from .attention_block import Attention_Block
 from .layer_norm import LayerNorm
 
@@ -13,7 +17,7 @@ class GPT(nn.Module):
         self.transformer = nn.ModuleDict(dict(
             #vocab-> embedding
             wte=nn.Embedding(config.vocab_size,config.n_embd),
-            wpe=nn.Embedding(config.vocab_size,config.n_embd),
+            wpe=nn.Embedding(config.block_size,config.n_embd),
             drop=nn.Dropout(config.dropout),
             attn_blocks = nn.ModuleList([Attention_Block(config) for _ in range(config.n_layer)]),
             ln_=LayerNorm(config.n_embd,bias=config.bias)
@@ -32,22 +36,17 @@ class GPT(nn.Module):
         #         for child in self.children():
         #             child.apply(fn)
 
-        #         fn(self)
-        #         return self
         # apply special scaled init to the residual projections, per GPT-2 paper
-        #This is done for the stability issue that occurs due to residual connections
         for pn, p in self.named_parameters():
-            if pn.endswith('c_proj.weight'):
+            if pn.endswith("c_proj.weight"):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
-        
     def __init__weights(self, module):
-            if isinstance(module, nn.Linear):
-                torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-                if module.bias is not None:
-                    torch.nn.init.zeros_(module.bias)
-            elif isinstance(module, nn.Embedding):
-                torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-                
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
     def forward(self, idx, targets=None):
         device = idx.device
         b, t = idx.size()
@@ -65,4 +64,3 @@ class GPT(nn.Module):
         logits=self.lm_head(x)
         
         return logits
-        
