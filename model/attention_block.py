@@ -1,15 +1,17 @@
 import torch 
 import torch.nn as nn
-from .attention import Attention 
-from .layer_norm import LayerNorm 
-from .mlp import MLP 
+from .attention_registry import build_attention
+from .layer_norm import LayerNorm
+from .mlp import MLP
 
 
 class Attention_Block(nn.Module):
     def __init__(self,config):
         super().__init__()
         self.lm1=LayerNorm(config.n_embd,bias=config.bias)
-        self.attn=Attention(config)
+        # which implementation this resolves to is decided by config.attention;
+        # see model/attention_registry.py
+        self.attn=build_attention(config)
         self.lm2=LayerNorm(config.n_embd,bias=config.bias)
         self.mlp=MLP(config)
         

@@ -1,11 +1,13 @@
-import math 
+import math
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from .attention_registry import BaseAttention, register_attention
 
-class Attention(nn.Module):
-    def __init__(self,config):
-        super().__init__()
+@register_attention("vanilla")
+class Attention(BaseAttention):
+    def __init__(self, config):
+        super().__init__(config)
         assert config.n_embd % config.n_head == 0
         self.Wq=nn.Linear(config.n_embd,config.n_embd, bias=config.bias)
         self.Wk=nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
