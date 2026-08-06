@@ -247,17 +247,10 @@ class CustomAttention(BaseAttention):
         # padding: the true minimum sum is 1 (row l=0 always contributes
         # exactly one unit of mass), so it should never actually engage.
         summary_causal = summary_causal / summary_causal.sum(dim=-1, keepdim=True).clamp_min(1e-6)
-        # per-block summary, used as pooling weights to build the earlier
-        # block's content key (Kbar, below) and pooled value (Pbar, in the
-        # combine step); safe to pool over the whole block since such a
-        # block is entirely in the past relative to any block that reads it.
-        summary = local.sum(dim=-2)  # (B, H, G, L)
-        # Same fix, same reason: the raw sum totals the block's real query
-        # count (L for a full block, fewer for a padded final block), not 1.
-        # Normalizing puts every block's pooling weights on the simplex
-        # regardless of how many real positions fed it, so blocks aren't
-        # implicitly weighted by their occupancy.
-        summary = summary / summary.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+
+        # per-block summary (pooled over all positions in the block) is the last
+        # row of the causal summary (the one that covers the whole block).
+        summary = summary_causal[..., -1, :]  # (B, H, G, L)
 
         # --- own-block causal output, extended with a fixed lookback into
         # the immediately preceding block (see __init__ for the reasoning) ---
@@ -296,7 +289,12 @@ class CustomAttention(BaseAttention):
         # different scale than an ordinary dot product. Q.Kbar below is a
         # standard scaled-dot-product content score instead, pooling K the
         # same way the combine step pools V.)
-        Kbar = torch.einsum('bhjk,bhjkd->bhjd', summary, K)  # (B,H,G,d) pooled content key, earlier blocks
+
+        # Pooled content keys for self (causal) and cross‑block (full block).
+        # We compute Kbar_causal once and derive Kbar from its last slice.
+        Kbar_causal = torch.einsum('bhjk,bhjkd->bhjd', summary_causal, K)  # (B,H,G,L,d)
+        Kbar = Kbar_causal[..., -1, :]                                    # (B,H,G,d) pooled over whole block
+
         global_scores = torch.einsum('bhild,bhjd->bhilj', Q, Kbar) * scale
 
         gate = self.content_scale.view(1, self.n_head, 1, 1)  # (1,H,1,1), broadcasts over self_scores
@@ -318,7 +316,6 @@ class CustomAttention(BaseAttention):
         # ones after position l, which would leak future tokens within the
         # block into position l's attention. `summary_causal` only
         # reflects rows 0..l, so pooling K with it stays causal.
-        Kbar_causal = torch.matmul(summary_causal, K)  # (B,H,G,L,d)
         self_scores = torch.einsum('bhild,bhild->bhil', Q, Kbar_causal) * scale
         self_scores = self_scores * gate
 
