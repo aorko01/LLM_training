@@ -14,100 +14,32 @@ def block_geometry(T):
     return G, L
 
 
-class _ScaledBlockCombine(torch.autograd.Function):
-    """
-    out[b,h,i,l,:] = self_w[b,h,i,l] * P[b,h,i,l,:] + sum_{j<i} glob[b,h,i,l,j] * Pbar[b,h,j,:]
-
-    where:
-      P[b,h,j,l,:]  = local[b,h,j,l,:]  @ V[b,h,j,:,:]   -- block j's own causal
-                                                             local output at offset l
-      Pbar[b,h,j,:] = summary[b,h,j,:] @ V[b,h,j,:,:]    -- a single whole-block
-                                                             pooled value for block j
-
-    glob is expected to already be masked to strictly j < i (row i=0 all zero).
-    self_w is the softmax weight the own block earns by competing against the
-    strictly-earlier blocks in the *same* normalization: for i>0,
-    glob[i,l,:].sum() + self_w[i,l] == 1 (up to dropout), so the own block no
-    longer gets an unconditional, unnormalized weight of 1 on top of the
-    other blocks' share. Block 0 has no earlier blocks to compete with, so
-    self_w == 1 there, which is the correct degenerate case.
-
-    Cross-block reads use Pbar (a full-block pooled summary) instead of
-    P[j,l] (block j's causal output at the *querying* position's own offset
-    l). Reading P[j,l] would mean a query at small l only ever sees the
-    first l+1 positions of any earlier block j, no matter how far in the
-    past j is -- an artificial bottleneck that has nothing to do with
-    causality (block j is entirely in the past regardless of l). Pbar has
-    no offset dependence, so every query that attends to block j sees the
-    same complete pooled representation of it. `summary` (block j's own
-    normalized local-attention mass over its positions -- see `forward`
-    docstring) does double duty as both the routing key for j and the
-    pooling weights that build Pbar, mirroring how `local` doubles as both
-    the own-block routing signal and the weights that build P.
-
-    P and Pbar are recomputed in backward instead of saved from forward, so
-    the module doesn't have to carry either the (B,H,G,L,d)-sized P or the
-    (B,H,G,d)-sized Pbar across the forward/backward boundary.
-
-    Shapes: local (B,H,G,L,L), glob (B,H,G,L,G), self_w (B,H,G,L),
-            summary (B,H,G,L), V (B,H,G,L,d).
-    """
-
-    @staticmethod
-    def forward(ctx, local, glob, self_w, summary, V):
-        ctx.save_for_backward(local, glob, self_w, summary, V)
-        P = torch.matmul(local, V)                                 # (B,H,G,L,d)
-        Pbar = torch.einsum('bhjk,bhjkd->bhjd', summary, V)         # (B,H,G,d)
-        mixed = torch.einsum('bhilj,bhjd->bhild', glob, Pbar)
-        own = self_w.unsqueeze(-1) * P
-        return own + mixed
-
-    @staticmethod
-    def backward(ctx, grad_out):
-        local, glob, self_w, summary, V = ctx.saved_tensors
-        d_local = d_glob = d_self_w = d_summary = d_V = None
-
-        need_P = ctx.needs_input_grad[0] or ctx.needs_input_grad[2] or ctx.needs_input_grad[4]
-        need_Pbar = ctx.needs_input_grad[1]
-        need_dPbar = ctx.needs_input_grad[3] or ctx.needs_input_grad[4]
-
-        if need_P:
-            P = torch.matmul(local, V)
-        if need_Pbar:
-            Pbar = torch.einsum('bhjk,bhjkd->bhjd', summary, V)
-
-        if ctx.needs_input_grad[2]:
-            d_self_w = torch.einsum('bhild,bhild->bhil', grad_out, P)
-
-        if ctx.needs_input_grad[1]:
-            d_glob = torch.einsum('bhild,bhjd->bhilj', grad_out, Pbar)
-
-        dPbar = None
-        if need_dPbar:
-            # gradient into block j's pooled value, summed over every (i,l)
-            # that attended to it
-            dPbar = torch.einsum('bhilj,bhild->bhjd', glob, grad_out)  # (B,H,G,d)
-
-        if ctx.needs_input_grad[0] or ctx.needs_input_grad[4]:
-            # dP now carries only the own-block (self_w) term -- mixed no
-            # longer reads P at all, so there's no glob-weighted term here
-            # the way there used to be
-            dP = self_w.unsqueeze(-1) * grad_out
-            if ctx.needs_input_grad[0]:
-                d_local = torch.matmul(dP, V.transpose(-2, -1))
-            if ctx.needs_input_grad[4]:
-                d_V = torch.matmul(local.transpose(-2, -1), dP)
-                d_V = d_V + torch.einsum('bhjk,bhjd->bhjkd', summary, dPbar)
-
-        if ctx.needs_input_grad[3]:
-            d_summary = torch.einsum('bhjd,bhjkd->bhjk', dPbar, V)
-
-        return d_local, d_glob, d_self_w, d_summary, d_V
-
-
 @register_attention("custom", "sqrt_block")
 class CustomAttention(BaseAttention):
-    """Drop-in replacement for `model.attention.Attention`; same in, same out."""
+    """Drop-in replacement for `model.attention.Attention`; same in, same out.
+
+    Two-level attention: an exact causal `local` pass inside each block, and
+    a coarse `cross`-block pass that lets each position attend to strictly
+    earlier blocks' pooled (summary, content) representations. The cross
+    pass is delegated to `F.scaled_dot_product_attention` (flash attention),
+    and its output is mixed into the exact local output through a
+    zero-initialized per-head gate (`global_scale`), so training starts
+    identical to plain block-local causal attention and only leans on
+    cross-block information once it's shown to help.
+
+    Earlier versions of this module ran the cross-block step by hand
+    (materializing a (B,H,G,L,G) score tensor, softmaxing it jointly with a
+    hand-rolled "self" score so the own block competed for a share of the
+    same normalization) and used a custom autograd.Function to avoid
+    carrying two extra tensors across the forward/backward boundary. Once
+    that step is handed to a fused attention kernel, its softmax is opaque
+    -- there's no logit or log-sum-exp to jointly normalize against an
+    external "self" term -- so the own block's contribution is instead just
+    `P` (the exact local output) added directly, and the custom
+    autograd.Function is gone too: SDPA already has its own efficient
+    backward, and `P`/`cross` are now independent tensors combined with a
+    plain add, which autograd handles on its own.
+    """
 
     def __init__(self, config):
         super().__init__(config)
@@ -122,16 +54,23 @@ class CustomAttention(BaseAttention):
         self.n_head = config.n_head
         self.block_size = config.block_size
 
-        # Gate on the content-based routing term added in `forward` (real
-        # Q.K similarity between a query and a pooled block representation,
-        # on top of the pattern-shape score). Zero-initialized per head so
-        # training starts identical to pattern-only routing and only leans
-        # on content once it's shown to help -- the two terms live on very
-        # different natural scales (content logits ~O(1) like ordinary
-        # attention scores; pattern logits are dot products of L-simplex
-        # vectors, typically << 1), so an ungated sum would let content
-        # drown out the pattern signal from the very first step.
+        # Gate on the content-based routing term folded into the cross-block
+        # query/key (real Q.K similarity between a query and a pooled block
+        # representation, on top of the pattern-shape score). Zero-initialized
+        # per head so training starts identical to pattern-only routing and
+        # only leans on content once it's shown to help -- the two terms live
+        # on very different natural scales (content logits ~O(1) like
+        # ordinary attention scores; pattern logits are dot products of
+        # L-simplex vectors, typically << 1), so an ungated sum would let
+        # content drown out the pattern signal from the very first step.
         self.content_scale = nn.Parameter(torch.zeros(self.n_head))
+
+        # Gate on the *entire* cross-block (flash-attention) branch, added on
+        # top of the exact local output `P`. Zero-initialized per head for
+        # the same warm-start reason as `content_scale`: at init this module
+        # is exactly block-local causal attention, and cross-block
+        # information is phased in only as training shows it helps.
+        self.global_scale = nn.Parameter(torch.zeros(self.n_head))
 
         G_max, L_max = block_geometry(config.block_size)
         span = max(G_max, L_max)
@@ -141,10 +80,9 @@ class CustomAttention(BaseAttention):
             torch.tril(torch.ones(span, span, dtype=torch.bool)),
             persistent=False,
         )
-        # global level: STRICT causal mask, j < i (a block never attends to
-        # itself via the *pooled* summary -- see Causality note below
-        # `forward`; the own block instead competes via a separate,
-        # causally-valid self score)
+        # cross-block level: STRICT causal mask, j < i (a block never attends
+        # to itself via the pooled summary -- its own contribution comes
+        # entirely from the exact local pass instead; see class docstring)
         self.register_buffer(
             "causal_mask_strict",
             torch.tril(torch.ones(span, span, dtype=torch.bool), diagonal=-1),
@@ -172,7 +110,8 @@ class CustomAttention(BaseAttention):
 
         Q, K, V = blocks(Q), blocks(K), blocks(V)
 
-        # --- local causal attention within each block ---
+        # --- local causal attention within each block: the own-block
+        # output, exact and fully causal, no pooling involved ---
         scores = torch.matmul(Q, K.transpose(-2, -1)) * (1.0 / math.sqrt(head_dim))
         allowed = self.causal_mask[:L, :L]
         if padding:
@@ -183,108 +122,79 @@ class CustomAttention(BaseAttention):
         if padding:
             local = local * real.view(G, L, 1).to(local.dtype)
 
-        # per-position CAUSAL summary: cumulative sum over the query axis, so
-        # position l's summary only reflects rows 0..l of its own block. This
-        # is what makes the global query side (and the self score below)
-        # causally valid.
+        # per-position causal running-average pattern: cumulative sum over
+        # the query axis, so position l's summary only reflects rows 0..l of
+        # its own block. This is the query side of the cross-block step
+        # below, and it's what keeps that step causally valid.
         summary_causal = local.cumsum(dim=-2)  # (B, H, G, L, L)
-        # Normalize each L-sized (key-axis) vector back onto the simplex.
-        # Raw cumsum grows with the query position l -- row l sums to l+1,
-        # not 1 -- so without this, positions later in a block would pick up
-        # systematically larger dot products below purely from accumulated
-        # magnitude, not from any real similarity. Dividing each vector by
-        # its own sum turns it into a running *average* of the local
-        # attention pattern seen so far (0..l), so scale no longer depends
-        # on l. clamp_min is just numerical-safety padding: the true minimum
-        # sum is 1 (row l=0 always contributes exactly one unit of mass), so
-        # it should never actually engage.
         summary_causal = summary_causal / summary_causal.sum(dim=-1, keepdim=True).clamp_min(1e-6)
-        # per-block summary, used only as the KEY side for strictly earlier
-        # blocks; safe to pool over the whole block since such a block is
-        # entirely in the past relative to any block that reads it.
-        # This is just the l=L-1 (last query offset) row of summary_causal,
-        # not a fresh reduction: the running cumsum has already picked up
-        # every row's contribution by the last offset (padded query rows are
-        # zeroed above, so they add nothing whether they land before or at
-        # l=L-1), and that row went through the exact same
-        # sum-normalize-onto-the-simplex step. Recomputing it from `local`
-        # via a second sum + normalize would just reproduce this slice.
+        # per-block pooled pattern: the key side of the cross-block step,
+        # one vector per block regardless of query offset (safe, since a
+        # block being read this way is entirely in the past). This is just
+        # the last (whole-block) offset of summary_causal, not a fresh
+        # reduction over `local` -- see the note in `_ScaledBlockCombine`'s
+        # historical version of this file for why that offset already
+        # equals the full-block sum.
         summary = summary_causal[..., -1, :]  # (B, H, G, L)
 
-        # --- causal attention between block i's per-position query and
-        # strictly earlier blocks' summaries ---
-        global_scores = torch.einsum('bhilm,bhjm->bhilj', summary_causal, summary)
-        global_scores = global_scores * (1.0 / math.sqrt(L))
-        strict_allowed = self.causal_mask_strict[:G, :G]  # (G, G), j < i only
-        global_scores = global_scores.masked_fill(
-            ~strict_allowed.view(1, 1, G, 1, G), float("-inf")
-        )
+        # content-based routing key for the cross-block step: pool K the
+        # same way `summary` pools local-attention mass, so the coarse
+        # routing score can compare real content, not just attention shape.
+        Kbar = torch.einsum('bhjk,bhjkd->bhjd', summary, K)  # (B, H, G, d)
 
-        # self score: lets block i's own (already-causal) local output
-        # compete for its share of the mix instead of being added back
-        # unconditionally at weight 1. We can't reuse the pooled `summary`
-        # as the key here -- it sums over every query in the block,
-        # including ones after position l, which would leak future tokens
-        # within the block into position l's attention. `summary_causal`
-        # dotted with itself only reflects rows 0..l, so it stays causal.
-        self_scores = torch.einsum('bhilm,bhilm->bhil', summary_causal, summary_causal)
-        self_scores = self_scores * (1.0 / math.sqrt(L))
+        # --- combined pattern+content query/key for the cross-block step ---
+        # Pre-scaling each half by its own dimension so a single dot product
+        # reproduces pattern_score/sqrt(L) + gate*content_score/sqrt(d)
+        # exactly lets us hand SDPA a flat `scale=1.0` instead of its default
+        # 1/sqrt(E) (which would apply one blended scale to both halves).
+        gate = self.content_scale.view(1, self.n_head, 1, 1, 1)
+        q_cross = torch.cat(
+            [summary_causal / (L ** 0.25), (gate * Q) / (head_dim ** 0.25)], dim=-1
+        )  # (B, H, G, L, L + d)
+        k_block = torch.cat(
+            [summary / (L ** 0.25), Kbar / (head_dim ** 0.25)], dim=-1
+        )  # (B, H, G, L + d)
 
-        # --- content-based routing term ---
-        # global_scores / self_scores above only compare *shapes* of local
-        # attention patterns (summary, summary_causal); two blocks with
-        # unrelated content but similarly-shaped local attention look
-        # identical to that score, and related blocks with differently
-        # shaped attention look unrelated. Add real Q.K content similarity
-        # on top, pooling K the same way fix #1 pools V -- reusing
-        # `summary`/`summary_causal` as pooling weights so no new routing
-        # tensors are needed, just K instead of V.
-        Kbar_causal = torch.matmul(summary_causal, K)  # (B,H,G,L,d) causal content key, own block
-        # Kbar is the same l=L-1 slice of Kbar_causal that `summary` is of
-        # summary_causal -- summary already equals summary_causal's last
-        # offset, so contracting that offset's row against K here reproduces
-        # the old independent `einsum('bhjk,bhjkd->bhjd', summary, K)`
-        # exactly, without a second matmul over K.
-        Kbar = Kbar_causal[..., -1, :]  # (B,H,G,d) content key, earlier blocks
-        content_global = torch.einsum('bhild,bhjd->bhilj', Q, Kbar) * (1.0 / math.sqrt(head_dim))
-        content_self = torch.einsum('bhild,bhild->bhil', Q, Kbar_causal) * (1.0 / math.sqrt(head_dim))
+        # pooled value per block (the thing cross-block queries actually
+        # read): summary is the pooling weight, same role `local` plays for
+        # the own-block output above. Its own dropout call, independent of
+        # the one applied to `local` below, right alongside the other
+        # weights about to multiply V.
+        summary_v = self.attn_dropout(summary).to(V.dtype)
+        Pbar = torch.einsum('bhjk,bhjkd->bhjd', summary_v, V)  # (B, H, G, d)
 
-        gate = self.content_scale.view(1, self.n_head, 1, 1)  # (1,H,1,1), broadcasts over self_scores
-        content_self = content_self * gate
-        content_global = content_global * gate.unsqueeze(-1)  # (1,H,1,1,1), extra dim for the block axis
+        # Strictly-causal block mask (j < i), plus one fallback "null" key
+        # reachable only from block 0's queries. Block 0 has no earlier
+        # blocks, so its mask row would otherwise be all-False -> NaN
+        # softmax; the null key carries a zero value, so block 0's
+        # cross-block contribution comes out exactly zero, matching the
+        # degenerate case handled by the old joint softmax.
+        strict_allowed = self.causal_mask_strict[:G, :G]  # (G, G)
+        block0_only = torch.zeros(G, 1, dtype=torch.bool, device=X.device)
+        block0_only[0, 0] = True
+        key_mask = torch.cat([strict_allowed, block0_only], dim=-1)  # (G, G+1)
+        key_mask = key_mask.unsqueeze(1).expand(G, L, G + 1).reshape(G * L, G + 1)
 
-        # add after masking global_scores, so strictly-later blocks (still
-        # -inf) stay -inf regardless of what content_global says about them
-        global_scores = global_scores + content_global
-        self_scores = self_scores + content_self
+        q_cross = q_cross.reshape(Batch, self.n_head, G * L, L + head_dim).to(V.dtype)
+        k_block_ext = torch.cat([k_block, torch.zeros_like(k_block[:, :, :1, :])], dim=2).to(V.dtype)
+        Pbar_ext = torch.cat([Pbar, torch.zeros_like(Pbar[:, :, :1, :])], dim=2)
 
-        # own block joins the same softmax as strictly-earlier blocks
-        all_scores = torch.cat([global_scores, self_scores.unsqueeze(-1)], dim=-1)  # (B,H,G,L,G+1)
-        glob_all = F.softmax(all_scores, dim=-1)
-        glob_all = torch.nan_to_num(glob_all, nan=0.0)  # safety net; block 0 no longer needs it
+        cross = F.scaled_dot_product_attention(
+            q_cross,
+            k_block_ext,
+            Pbar_ext,
+            attn_mask=key_mask,
+            dropout_p=self.attn_dropout.p if self.training else 0.0,
+            scale=1.0,
+        )  # (B, H, G*L, d)
+        cross = cross.view(Batch, self.n_head, G, L, head_dim)
 
-        glob = glob_all[..., :G]        # (B, H, G, L, G) weight on strictly earlier blocks
-        self_weight = glob_all[..., G]  # (B, H, G, L)    weight on own block
-
-        # `summary` now feeds Pbar = summary @ V inside the combine function
-        # (see below), i.e. it directly pools V the same way `local` does
-        # for the own-block term -- so it gets its own independent dropout
-        # mask here too, right alongside the other weights that are about
-        # to multiply V. This is a fresh call to the same dropout module,
-        # not a reuse of anything computed above.
         local = self.attn_dropout(local)
-        glob = self.attn_dropout(glob)
-        self_weight = self.attn_dropout(self_weight)
-        summary_v = self.attn_dropout(summary)
         local = local.to(V.dtype)
-        glob = glob.to(V.dtype)
-        self_weight = self_weight.to(V.dtype)
-        summary_v = summary_v.to(V.dtype)
+        P = torch.matmul(local, V)  # (B, H, G, L, d) exact, own-block causal output
 
-        # cross-block reads now go through Pbar = summary_v @ V (a whole-block
-        # pooled value), not P[j, l] (block j's own output at the querying
-        # position's offset l) -- see _ScaledBlockCombine docstring.
-        y = _ScaledBlockCombine.apply(local, glob, self_weight, summary_v, V)  # (B, H, G, L, head_dim)
+        out_gate = self.global_scale.view(1, self.n_head, 1, 1, 1)
+        y = P + out_gate * cross
 
         y = y.permute(0, 2, 3, 1, 4).reshape(Batch, G * L, Embedding)
         if padding:
