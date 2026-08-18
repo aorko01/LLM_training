@@ -31,7 +31,7 @@ class CustomAttention(BaseAttention):
     of the cross-block routing replaced by a *query-blocks* term. v1 built
     the coarse query/key from the block's causal running-average pattern, so
     the routing score was a blend of pattern-shape similarity and content
-    similarity. Here that pattern term is gone: a small per-layer MLP
+    similarity. Here that pattern term is gone: one small MLP per head
     compresses each block of queries into a single query-shaped vector, and
     the routing score is the similarity between an individual query position
     and those compressed block queries (Q vs. `q_block`). The content term
@@ -59,17 +59,22 @@ class CustomAttention(BaseAttention):
         span = max(G_max, L_max)
         head_dim = config.n_embd // config.n_head
 
-        # Small per-layer MLP that compresses a whole block of queries
-        # (L_max * head_dim flattened) down to a single query's dimension
-        # (head_dim), one vector per block per head. These compressed block
-        # queries are the key side of the *query-blocks* routing term: each
-        # individual query position of a later block scores its similarity
-        # against them.
+        # Small per-head MLPs -- one for each head of this layer -- that
+        # compress a whole block of queries (L_max * head_dim flattened)
+        # down to a single query's dimension (head_dim), one vector per
+        # block. These compressed block queries are the key side of the
+        # *query-blocks* routing term: each individual query position of a
+        # later block scores its similarity against them.
         compress_hidden = max(2 * head_dim, 16)
-        self.compress = nn.Sequential(
-            nn.Linear(L_max * head_dim, compress_hidden, bias=config.bias),
-            nn.GELU(),
-            nn.Linear(compress_hidden, head_dim, bias=config.bias),
+        self.compress = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Linear(L_max * head_dim, compress_hidden, bias=config.bias),
+                    nn.GELU(),
+                    nn.Linear(compress_hidden, head_dim, bias=config.bias),
+                )
+                for _ in range(self.n_head)
+            ]
         )
         self._L_max = L_max
 
@@ -160,13 +165,17 @@ class CustomAttention(BaseAttention):
 
         # --- compressed block queries: the key side of the query-blocks
         # routing term. Flatten each block's queries (L * d per head) and
-        # push it through the per-layer MLP to get one query-shaped vector
-        # per block. Padding to `_L_max` covers runs where the runtime
-        # block length L is smaller than the architecture's maximum.
+        # push it through that head's own per-layer MLP to get one
+        # query-shaped vector per block. Padding to `_L_max` covers runs
+        # where the runtime block length L is smaller than the
+        # architecture's maximum.
         Q_flat = Q.reshape(Batch, self.n_head, G, L * head_dim)
         if L < self._L_max:
             Q_flat = F.pad(Q_flat, (0, self._L_max * head_dim - L * head_dim))
-        q_block = self.compress(Q_flat)  # (B, H, G, d)
+        q_flat_h = Q_flat.permute(1, 0, 2, 3)  # (H, B, G, L_max*d)
+        q_block = torch.stack(
+            [self.compress[h](q_flat_h[h]) for h in range(self.n_head)], dim=0
+        ).permute(1, 0, 2, 3)  # (H, B, G, d) -> (B, H, G, d)
 
         # --- combined query-blocks + content query/key for the cross-block
         # step. Both halves now live in the query's dimension d (the pattern
